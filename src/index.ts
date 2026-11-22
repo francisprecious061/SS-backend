@@ -58,6 +58,7 @@ import {
   scheduleListingExpirySweep,
 } from "./services/secondary-market.service";
 import { createWatchlistService } from "./services/watchlist.service";
+import { createInvestorInsightsService } from "./services/investor-insights.service";
 import { createSettlementWorker } from "./workers/settlement.worker";
 import { scheduleAnalyticsSnapshotJob } from "./workers/analytics-snapshot.worker";
 import {
@@ -279,6 +280,11 @@ export async function bootstrap(): Promise<{
   // ---- Feature: Watchlist ----
   const watchlistService = createWatchlistService(dataSource);
 
+  // ---- Feature: Alert preferences & preview (issue #811) ----
+  // HTTP only. Not handed to the event indexer: alert delivery needs
+  // NOTIFICATION_SERVICE_URL, which is not configured yet.
+  const investorInsightsService = createInvestorInsightsService(dataSource);
+
   // ---- Feature: Settlement Worker ----
   const settlementWorker = createSettlementWorker(dataSource, settlementService);
   const pendingStellarConfirmationWorker = invoiceEscrowContract
@@ -354,6 +360,7 @@ export async function bootstrap(): Promise<{
     secondaryMarketService,
     secondaryDepthService,
     watchlistService,
+    investorInsightsService,
     settlementWorker,
     invoiceEscrowContractService: invoiceEscrowContract,
     feeScheduleService,

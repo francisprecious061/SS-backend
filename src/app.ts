@@ -40,6 +40,7 @@ import { createKeysRouter } from "./routes/keys.routes";
 import { createDividendsRouter } from "./routes/dividends.routes";
 import { createSecondaryMarketRouter } from "./routes/secondary-market.routes";
 import { createWatchlistRouter } from "./routes/watchlist.routes";
+import { createInvestorInsightsRouter } from "./routes/investor-insights.routes";
 import type { RatingsLeaderboardService } from "./services/ratings-leaderboard.service";
 import type { DividendCycleService } from "./services/dividend-cycle.service";
 import type { DividendDistributionService } from "./services/dividend-distribution.service";
@@ -91,6 +92,7 @@ import type { AdminMetricsService } from "./services/admin-metrics.service";
 import type { PortfolioService } from "./services/portfolio.service";
 import type { SecondaryMarketService } from "./services/secondary-market.service";
 import type { WatchlistService } from "./services/watchlist.service";
+import type { InvestorInsightsService } from "./services/investor-insights.service";
 import type { SettlementWorker } from "./workers/settlement.worker";
 import type { FeeScheduleService } from "./services/fee-schedule.service";
 import type { IssuerReputationService } from "./services/issuer-reputation.service";
@@ -106,6 +108,7 @@ import type { SecondaryAuctionService } from "./services/secondary-auction.servi
 import type { InvestorAccreditationService } from "./services/investor-accreditation.service";
 
 import dataSource from "./config/database";
+import { getStellarNetworksConfig } from "./config/stellar-networks";
 import { getRedisClient } from "./config/redis";
 import packageInfo from "../package.json";
 
@@ -114,17 +117,26 @@ const READINESS_CHECK_TIMEOUT_MS = 80;
 export interface ReadinessChecks {
   database: () => Promise<unknown>;
   redis: () => Promise<unknown>;
+  migrations?: () => Promise<unknown>;
+  stellarConfig?: () => Promise<unknown>;
+}
+
+interface ReadinessFailure {
+  code: string;
+  error: string;
 }
 
 interface DependencyHealth {
   status: "ok" | "unhealthy";
+  code?: string;
   error?: string;
 }
 
 async function checkDependency(
-  name: "database" | "redis",
+  name: string,
   check: () => Promise<unknown>,
-  appLogger: AppLogger
+  appLogger: AppLogger,
+  failure: ReadinessFailure
 ): Promise<DependencyHealth> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -146,7 +158,8 @@ async function checkDependency(
     });
     return {
       status: "unhealthy",
-      error: `${name} connectivity check failed`,
+      code: failure.code,
+      error: failure.error,
     };
   } finally {
     if (timer) clearTimeout(timer);
@@ -243,6 +256,8 @@ export interface AppDependencies {
   secondaryMarketService?: SecondaryMarketService;
   secondaryDepthService?: SecondaryDepthService;
   watchlistService?: WatchlistService;
+  /** Issue #811 — alert preferences (read/update) and render-only preview. */
+  investorInsightsService?: InvestorInsightsService;
   settlementWorker?: SettlementWorker;
   acknowledgementService?: InvestorAcknowledgementService;
   extensionService?: InvoiceExtensionService;
@@ -318,6 +333,7 @@ export function createApp({
   secondaryMarketService,
   secondaryDepthService,
   watchlistService,
+  investorInsightsService,
   settlementWorker,
   acknowledgementService,
   portfolioService,
@@ -425,29 +441,75 @@ export function createApp({
     });
   });
 
+  app.get("/health/live", (_req, res) => {
+    res.status(200).json({
+      success: true,
+      data: {
+        status: "alive",
+        timestamp: new Date().toISOString(),
+        uptimeSeconds: Number(process.uptime().toFixed(3)),
+      },
+    });
+  });
+
   app.get("/ready", async (_req, res) => {
-    const checks: ReadinessChecks = readinessChecks ?? {
-      database: async () => {
-        if (!dataSource.isInitialized) {
-          throw new Error("Database connection is not initialized");
-        }
-        await dataSource.query("SELECT 1");
-      },
-      redis: async () => {
-        await getRedisClient().ping();
-      },
+    const checks = {
+      database:
+        readinessChecks?.database ??
+        (async () => {
+          if (!dataSource.isInitialized) {
+            throw new Error("Database connection is not initialized");
+          }
+          await dataSource.query("SELECT 1");
+        }),
+      redis:
+        readinessChecks?.redis ??
+        (async () => {
+          await getRedisClient().ping();
+        }),
+      migrations:
+        readinessChecks?.migrations ??
+        (async () => {
+          if (!dataSource.isInitialized) {
+            throw new Error("Database connection is not initialized");
+          }
+          if (await dataSource.showMigrations()) {
+            throw new Error("Pending migrations");
+          }
+        }),
+      stellarConfig:
+        readinessChecks?.stellarConfig ??
+        (async () => {
+          getStellarNetworksConfig();
+        }),
     };
-    const [database, redis] = await Promise.all([
-      checkDependency("database", checks.database, appLogger),
-      checkDependency("redis", checks.redis, appLogger),
+
+    const [database, redis, migrations, stellarConfig] = await Promise.all([
+      checkDependency("database", checks.database, appLogger, {
+        code: "DATABASE_UNAVAILABLE",
+        error: "database connectivity check failed",
+      }),
+      checkDependency("redis", checks.redis, appLogger, {
+        code: "REDIS_UNAVAILABLE",
+        error: "redis connectivity check failed",
+      }),
+      checkDependency("migrations", checks.migrations, appLogger, {
+        code: "MIGRATIONS_PENDING",
+        error: "database migrations are pending or could not be verified",
+      }),
+      checkDependency("stellarConfig", checks.stellarConfig, appLogger, {
+        code: "STELLAR_CONFIG_INVALID",
+        error: "stellar configuration is missing or invalid",
+      }),
     ]);
-    const ready = database.status === "ok" && redis.status === "ok";
+    const dependencies = { database, redis, migrations, stellarConfig };
+    const ready = Object.values(dependencies).every((dependency) => dependency.status === "ok");
 
     res.status(ready ? 200 : 503).json({
       success: ready,
       data: {
         status: ready ? "ready" : "not_ready",
-        dependencies: { database, redis },
+        dependencies,
       },
     });
   });
@@ -622,6 +684,10 @@ export function createApp({
     app.use("/api/v1/secondary-market", secondaryMarketRouter);
     app.use("/secondary-market", secondaryMarketRouter);
     app.use("/api/v1/secondary", secondaryMarketRouter);
+  }
+
+  if (investorInsightsService && authService) {
+    app.use("/api/v1/investors", createInvestorInsightsRouter(investorInsightsService, authService));
   }
 
   if (watchlistService && authService) {

@@ -13,6 +13,13 @@ import type { ContractEventBus } from "../contract-event-bus.service";
 import type { SettlementService } from "../settlement.service";
 import { scaledBigIntToDecimalString } from "../../lib/decimal-bigint";
 import type { InvestorInsightsService } from "../investor-insights.service";
+import {
+  parseLedgerTime,
+  processingLagMs,
+  type InvalidLedgerTimeReason,
+  type LedgerTimeResult,
+} from "../../lib/ledger-time";
+import { recordReliabilityMetric } from "../../observability/reliability-metrics";
 
 export interface EventIndexerServiceDependencies {
   contractIds: string[];
@@ -164,14 +171,16 @@ export class EventIndexerService {
         : typeof rawRecord.pagingToken === "string"
           ? rawRecord.pagingToken
           : rawEvent.id;
-    const occurredAt = new Date(rawEvent.ledgerClosedAt);
+    // Same strict parser ingestion uses: a lenient `new Date()` would accept
+    // zone-less or impossible dates (Feb 30 rolls forward to March).
+    const occurredAt = parseLedgerTime(rawEvent.ledgerClosedAt);
 
     return {
       id: rawEvent.id,
       contractId: contractIdStr,
       ledger: Number(rawEvent.ledger),
       ledgerClosedAt: rawEvent.ledgerClosedAt,
-      occurredAt: Number.isNaN(occurredAt.getTime()) ? undefined : occurredAt,
+      occurredAt: occurredAt.ok ? occurredAt.value : undefined,
       txHash,
       topic: primaryTopic,
       topics: decodedTopics,
@@ -262,38 +271,62 @@ export class EventIndexerService {
     let processedCount = 0;
     let highestProcessedLedger = this.lastIndexedLedger;
 
-    for (const event of events) {
-      const eventId = event.id || `${event.txHash}:${event.topic}:${event.ledger}`;
+    for (const incoming of events) {
+      const eventId = incoming.id || `${incoming.txHash}:${incoming.topic}:${incoming.ledger}`;
       try {
         const existingLog = this.eventLogRepository
           ? await this.eventLogRepository.findOne({ where: { eventId } })
           : null;
 
         if (existingLog?.processed) {
-          highestProcessedLedger = Math.max(highestProcessedLedger, event.ledger);
+          highestProcessedLedger = Math.max(highestProcessedLedger, incoming.ledger);
           processedCount++;
           continue;
         }
 
         const existing = this.eventLogRepository
           ? await this.eventLogRepository.findOne({
-              where: { contractId: event.contractId, eventId: event.id },
+              where: { contractId: incoming.contractId, eventId: incoming.id },
             })
           : null;
 
         const receipts = !existing?.processed && this.dataSource?.options.type === "postgres"
           ? await this.dataSource.query(
               `SELECT 1 FROM event_replay_receipts WHERE source = $1 AND scope = $2 AND event_id = $3`,
-              ["soroban_event_logs", event.contractId, eventId],
+              ["soroban_event_logs", incoming.contractId, eventId],
             ) : [];
         if (existing?.processed || receipts.length > 0) {
           processedCount++;
           continue;
         }
 
+        // Issue #812: the first valid ledger time stored for an event is
+        // authoritative. A replay may fill a missing value but never replaces
+        // one, and projections always see the stored time.
+        const ledgerTime = this.resolveLedgerTime(incoming, eventId, existingLog?.ledgerClosedAt);
+        if (!ledgerTime.ok) {
+          await this.quarantine(incoming, eventId, existingLog, ledgerTime.reason);
+          // Advance past it so one bad event cannot stall the indexer; the
+          // quarantined row keeps the payload for remediation and replay.
+          highestProcessedLedger = Math.max(highestProcessedLedger, incoming.ledger);
+          continue;
+        }
+        const event: DecodedSorobanEvent = {
+          ...incoming,
+          ledgerClosedAt: ledgerTime.value.toISOString(),
+          occurredAt: ledgerTime.value,
+        };
+
         if (this.eventLogRepository) {
           if (existingLog) {
-            await this.eventLogRepository.update({ eventId }, { processed: false });
+            await this.eventLogRepository.update(
+              { eventId },
+              {
+                processed: false,
+                // Fill only: an existing ledger time is never overwritten.
+                ...(existingLog.ledgerClosedAt ? {} : { ledgerClosedAt: ledgerTime.value }),
+              }
+            );
           } else {
             const logEntry = this.eventLogRepository.create({
               eventId,
@@ -304,8 +337,10 @@ export class EventIndexerService {
               payload: {
                 topics: event.topics,
                 data: event.data,
-                ledgerClosedAt: event.ledgerClosedAt,
+                // The raw value as received, kept for audit.
+                ledgerClosedAt: incoming.ledgerClosedAt,
               },
+              ledgerClosedAt: ledgerTime.value,
               processed: false,
             });
             await this.eventLogRepository.save(logEntry);
@@ -319,8 +354,28 @@ export class EventIndexerService {
           await this.eventBus.dispatch(event);
         }
 
+        const processedAt = new Date();
         if (this.eventLogRepository) {
-          await this.eventLogRepository.update({ eventId }, { processed: true });
+          await this.eventLogRepository.update(
+            { eventId },
+            {
+              processed: true,
+              processedAt,
+              // A replay that arrives with a valid time releases a quarantined event.
+              quarantineReason: null,
+              quarantinedAt: null,
+            }
+          );
+        }
+        const lagMs = processingLagMs(ledgerTime.value, processedAt);
+        if (lagMs !== null) {
+          this.logger.debug("Processed Soroban event", {
+            eventId,
+            topic: event.topic,
+            ledgerClosedAt: ledgerTime.value.toISOString(),
+            processedAt: processedAt.toISOString(),
+            processingLagMs: lagMs,
+          });
         }
 
         highestProcessedLedger = Math.max(highestProcessedLedger, event.ledger);
@@ -328,8 +383,8 @@ export class EventIndexerService {
       } catch (err) {
         this.logger.error("Error processing Soroban event", {
           err,
-          eventId: event.id,
-          topic: event.topic,
+          eventId: incoming.id,
+          topic: incoming.topic,
         });
         throw err;
       }
@@ -347,6 +402,82 @@ export class EventIndexerService {
     }
 
     return processedCount;
+  }
+
+  /**
+   * Pick the ledger time to process an event with. A stored value always
+   * wins; a replay carrying a different time is logged and ignored, since
+   * ledger time is fixed once the ledger closes.
+   */
+  private resolveLedgerTime(
+    event: DecodedSorobanEvent,
+    eventId: string,
+    stored: Date | null | undefined,
+  ): LedgerTimeResult {
+    const incoming = parseLedgerTime(event.ledgerClosedAt);
+    if (stored) {
+      const storedTime = new Date(stored);
+      if (incoming.ok && incoming.value.getTime() !== storedTime.getTime()) {
+        recordReliabilityMetric("indexer_ledger_time_conflicts");
+        this.logger.warn("Replayed event carried a different ledger time; keeping the stored value", {
+          eventId,
+          storedLedgerClosedAt: storedTime.toISOString(),
+          replayedLedgerClosedAt: incoming.value.toISOString(),
+        });
+      }
+      return { ok: true, value: storedTime };
+    }
+    return incoming;
+  }
+
+  /**
+   * Record an event whose ledger time is invalid without projecting it.
+   * The row stays `processed = false`, so retention never archives it, and
+   * a later replay with a valid time releases it.
+   */
+  private async quarantine(
+    event: DecodedSorobanEvent,
+    eventId: string,
+    existingLog: SorobanEventLog | null,
+    reason: InvalidLedgerTimeReason,
+  ): Promise<void> {
+    const quarantineReason = `invalid_ledger_time:${reason}`;
+    recordReliabilityMetric("indexer_events_quarantined");
+    this.logger.warn("Quarantined Soroban event with an invalid ledger time", {
+      eventId,
+      topic: event.topic,
+      ledger: event.ledger,
+      reason,
+      rawLedgerClosedAt: event.ledgerClosedAt ?? null,
+    });
+
+    if (!this.eventLogRepository) return;
+    if (existingLog) {
+      if (existingLog.quarantinedAt) return;
+      await this.eventLogRepository.update(
+        { eventId },
+        { quarantineReason, quarantinedAt: new Date() },
+      );
+      return;
+    }
+    await this.eventLogRepository.save(
+      this.eventLogRepository.create({
+        eventId,
+        contractId: event.contractId,
+        ledgerSequence: event.ledger.toString(),
+        topic: event.topic,
+        txHash: event.txHash,
+        payload: {
+          topics: event.topics,
+          data: event.data,
+          ledgerClosedAt: event.ledgerClosedAt ?? null,
+        },
+        ledgerClosedAt: null,
+        processed: false,
+        quarantineReason,
+        quarantinedAt: new Date(),
+      }),
+    );
   }
 
   public async saveCheckpoint(ledgerSequence: number): Promise<void> {
